@@ -9,7 +9,8 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from comic_text_detector.basemodel import TextDetBase, TextDetBaseDNN
+from comic_text_detector.backends import create_compute_backend
+from comic_text_detector.basemodel import TextDetBaseDNN
 from comic_text_detector.utils.db_utils import SegDetectorRepresenter
 from comic_text_detector.utils.imgproc_utils import letterbox, xyxy2yolo, get_yololabel_strings
 from comic_text_detector.utils.io_utils import imread, imwrite, find_all_imgs, NumpyEncoder
@@ -72,17 +73,20 @@ def model2annotations(model_path, img_dir_list, save_dir, save_json=False):
         imwrite(osp.join(save_dir, imgname), img)
         imwrite(osp.join(save_dir, maskname), mask_refined)
 
+def _preprocessed_to_nchw(img):
+    img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
+    return np.array([np.ascontiguousarray(img)]).astype(np.float32) / 255
+
+
 def preprocess_img(img, input_size=(1024, 1024), device='cpu', bgr2rgb=True, half=False, to_tensor=True):
     if bgr2rgb:
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     img_in, ratio, (dw, dh) = letterbox(img, new_shape=input_size, auto=False, stride=64)
     if to_tensor:
-        img_in = img_in.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
-        img_in = np.array([np.ascontiguousarray(img_in)]).astype(np.float32) / 255
-        if to_tensor:
-            img_in = torch.from_numpy(img_in).to(device)
-            if half:
-                img_in = img_in.half()
+        img_in = _preprocessed_to_nchw(img_in)
+        img_in = torch.from_numpy(img_in).to(device)
+        if half:
+            img_in = img_in.half()
     return img_in, ratio, int(dw), int(dh)
 
 def postprocess_mask(img: Union[torch.Tensor, np.ndarray], thresh=None):
@@ -104,8 +108,8 @@ def postprocess_mask(img: Union[torch.Tensor, np.ndarray], thresh=None):
 def postprocess_yolo(det, conf_thresh, nms_thresh, resize_ratio, sort_func=None):
     det = non_max_suppression(det, conf_thresh, nms_thresh)[0]
     # bbox = det[..., 0:4]
-    if det.device != 'cpu':
-        det = det.detach_().cpu().numpy()
+    if isinstance(det, torch.Tensor):
+        det = det.detach().cpu().numpy()
     det[..., [0, 2]] = det[..., [0, 2]] * resize_ratio[0]
     det[..., [1, 3]] = det[..., [1, 3]] * resize_ratio[1]
     if sort_func is not None:
@@ -139,17 +143,25 @@ class TextDetector:
     lang_list = ['eng', 'ja', 'unknown']
     langcls2idx = {'eng': 0, 'ja': 1, 'unknown': 2}
 
-    def __init__(self, model_path, input_size=1024, device='cpu', half=False, nms_thresh=0.35, conf_thresh=0.4, mask_thresh=0.3, act='leaky'):
+    def __init__(self, model_path, input_size=1024, device='cpu', half=False, nms_thresh=0.35, conf_thresh=0.4, mask_thresh=0.3, act='leaky', backend='auto'):
         super(TextDetector, self).__init__()
 
-        if Path(model_path).suffix == '.onnx':
+        self.backend = self._resolve_backend(model_path, backend)
+        self.compute_backend = None
+
+        if self.backend == 'opencv':
             self.model = cv2.dnn.readNetFromONNX(model_path)
             self.net = TextDetBaseDNN(input_size, model_path)
-            self.backend = 'opencv'
         else:
-            self.net = TextDetBase(model_path, device=device, act=act)
-            self.backend = 'torch'
-        
+            self.compute_backend = create_compute_backend(
+                self.backend,
+                model_path=model_path,
+                device=device,
+                half=half,
+                act=act,
+            )
+            self.net = getattr(self.compute_backend, 'net', None)
+
         if isinstance(input_size, int):
             input_size = (input_size, input_size)
         self.input_size = input_size
@@ -159,16 +171,43 @@ class TextDetector:
         self.nms_thresh = nms_thresh
         self.seg_rep = SegDetectorRepresenter(thresh=0.3)
 
+    @staticmethod
+    def _resolve_backend(model_path, backend):
+        valid_backends = {'auto', 'torch', 'opencv', 'mlx'}
+        if backend not in valid_backends:
+            raise ValueError(f"backend must be one of {sorted(valid_backends)}")
+
+        is_onnx = Path(model_path).suffix == '.onnx'
+        if is_onnx:
+            if backend not in {'auto', 'opencv'}:
+                raise ValueError("ONNX detector models require backend='opencv' or backend='auto'")
+            return 'opencv'
+
+        if backend == 'opencv':
+            raise ValueError("backend='opencv' requires an ONNX detector model")
+        if backend == 'auto':
+            return 'torch'
+        return backend
+
     @torch.no_grad()
     def __call__(self, img, refine_mode=REFINEMASK_INPAINT, keep_undetected_mask=False):
         return self._detect_single(img, refine_mode=refine_mode, keep_undetected_mask=keep_undetected_mask)
 
     @torch.no_grad()
     def _detect_single(self, img, refine_mode=REFINEMASK_INPAINT, keep_undetected_mask=False):
-        img_in, ratio, dw, dh = preprocess_img(img, input_size=self.input_size, device=self.device, half=self.half, to_tensor=self.backend=='torch')
+        img_in, ratio, dw, dh = preprocess_img(
+            img,
+            input_size=self.input_size,
+            device=self.device,
+            half=self.half,
+            to_tensor=False,
+        )
         im_h, im_w = img.shape[:2]
 
-        blks, mask, lines_map = self.net(img_in)
+        if self.backend == 'opencv':
+            blks, mask, lines_map = self.net(img_in)
+        else:
+            blks, mask, lines_map = self.compute_backend.forward(_preprocessed_to_nchw(img_in))
 
         resize_ratio = (im_w / (self.input_size[0] - dw), im_h / (self.input_size[1] - dh))
         blks = postprocess_yolo(blks, self.conf_thresh, self.nms_thresh, resize_ratio)
@@ -204,7 +243,7 @@ class TextDetector:
 
     @torch.no_grad()
     def detect_batch(self, imgs, refine_mode=REFINEMASK_INPAINT, keep_undetected_mask=False):
-        if self.backend != 'torch' or self.device == 'cpu' or len(imgs) <= 1:
+        if self.backend == 'opencv' or (self.backend == 'torch' and self.device == 'cpu') or len(imgs) <= 1:
             return [
                 self._detect_single(img, refine_mode=refine_mode, keep_undetected_mask=keep_undetected_mask)
                 for img in imgs
@@ -218,15 +257,15 @@ class TextDetector:
                 input_size=self.input_size,
                 device=self.device,
                 half=self.half,
-                to_tensor=True,
+                to_tensor=False,
             )
-            img_ins.append(img_in)
+            img_ins.append(_preprocessed_to_nchw(img_in)[0])
             im_h, im_w = img.shape[:2]
             resize_ratio = (im_w / (self.input_size[0] - dw), im_h / (self.input_size[1] - dh))
             metadata.append((img, im_w, im_h, dw, dh, resize_ratio))
 
-        img_in = torch.cat(img_ins, dim=0)
-        blks, mask, lines_map = self.net(img_in)
+        img_in = np.stack(img_ins, axis=0).astype(np.float32)
+        blks, mask, lines_map = self.compute_backend.forward(img_in)
         blks_batch = postprocess_yolo_batch(
             blks,
             self.conf_thresh,
@@ -237,7 +276,7 @@ class TextDetector:
         def postprocess_one(args):
             batch_idx, (meta, blks) = args
             img, im_w, im_h, dw, dh, resize_ratio = meta
-            mask_one = postprocess_mask(mask[batch_idx].clone())
+            mask_one = postprocess_mask(mask[batch_idx])
 
             lines, scores = self.seg_rep(self.input_size, lines_map[batch_idx:batch_idx + 1])
             box_thresh = 0.6

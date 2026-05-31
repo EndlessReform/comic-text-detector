@@ -1,0 +1,57 @@
+[project]
+name = "comic-text-detector"
+version = "0.1.0"
+authors = [
+    {name = "dmMaze"},
+    {name = "Maciej Budys", email = "kha-white@mail.com"},
+    {name = "Jacob Keisling", email = "contact@keisling.me"},
+]
+description = "Manga and comic text detection"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {file = "LICENSE"}
+classifiers = [
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "Programming Language :: Python :: 3",
+]
+dependencies = [
+    "numpy",
+    "opencv-python>=4.1.2",
+    "onnx>=1.9.0",
+    "onnx-simplifier>=0.3.6",
+    "Pillow>=7.1.2",
+    "pyclipper",
+    "shapely",
+    "torch>=1.7.0",
+    "torchsummary",
+    "torchvision>=0.8.1",
+    "tqdm>=4.41.0",
+]
+
+[project.optional-dependencies]
+mlx = [
+    "huggingface-hub>=1.0",
+    "mlx>=0.31",
+    "safetensors>=0.5",
+]
+
+[project.urls]
+Homepage = "https://github.com/EndlessReform/comic-text-detector"
+
+[build-system]
+requires = ["setuptools >= 61.0.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = [
+    "comic_text_detector",
+    "comic_text_detector.models",
+    "comic_text_detector.models.yolov5",
+    "comic_text_detector.scripts",
+    "comic_text_detector.utils",
+]
+package-dir = {"comic_text_detector" = "."}
+license-files = ["LICENSE"]
+
+[tool.setuptools.package-data]
+comic_text_detector = ["data/*.yaml"]

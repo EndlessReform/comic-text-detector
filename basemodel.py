@@ -241,7 +241,9 @@ class TextDetBase(nn.Module):
         blks, features = self.blk_det(features, detect=True)
         mask, features = self.text_seg(*features, forward_mode=TEXTDET_INFERENCE)
         lines = self.text_det(*features, step_eval=False)
-        return blks[0], mask, lines
+        if isinstance(blks, (tuple, list)):
+            blks = blks[0]
+        return blks, mask, lines
 
 class TextDetBaseDNN:
     def __init__(self, input_size, model_path):
@@ -269,5 +271,4 @@ if __name__ == '__main__':
     # model.initialize_db(unet_weights='data/unet_head.pt')
     # model.train_db()
     # summary(model, (3, 640, 640), device=DEVICE)
-
 

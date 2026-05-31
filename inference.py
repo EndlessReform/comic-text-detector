@@ -1,6 +1,7 @@
 import json
 import os.path as osp
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 from typing import Union
 
 import cv2
@@ -115,13 +116,31 @@ def postprocess_yolo(det, conf_thresh, nms_thresh, resize_ratio, sort_func=None)
     cls = det[..., 5].astype(np.int32)
     return blines, cls, confs
 
+def postprocess_yolo_batch(det, conf_thresh, nms_thresh, resize_ratio_list, sort_func=None):
+    detections = non_max_suppression(det, conf_thresh, nms_thresh)
+    out = []
+    for det, resize_ratio in zip(detections, resize_ratio_list):
+        if det.device != 'cpu':
+            det = det.detach_().cpu().numpy()
+        else:
+            det = det.detach().numpy()
+        det[..., [0, 2]] = det[..., [0, 2]] * resize_ratio[0]
+        det[..., [1, 3]] = det[..., [1, 3]] * resize_ratio[1]
+        if sort_func is not None:
+            det = sort_func(det)
+
+        blines = det[..., 0:4].astype(np.int32)
+        confs = np.round(det[..., 4], 3)
+        cls = det[..., 5].astype(np.int32)
+        out.append((blines, cls, confs))
+    return out
+
 class TextDetector:
     lang_list = ['eng', 'ja', 'unknown']
     langcls2idx = {'eng': 0, 'ja': 1, 'unknown': 2}
 
     def __init__(self, model_path, input_size=1024, device='cpu', half=False, nms_thresh=0.35, conf_thresh=0.4, mask_thresh=0.3, act='leaky'):
         super(TextDetector, self).__init__()
-        cuda = device == 'cuda'
 
         if Path(model_path).suffix == '.onnx':
             self.model = cv2.dnn.readNetFromONNX(model_path)
@@ -142,6 +161,10 @@ class TextDetector:
 
     @torch.no_grad()
     def __call__(self, img, refine_mode=REFINEMASK_INPAINT, keep_undetected_mask=False):
+        return self._detect_single(img, refine_mode=refine_mode, keep_undetected_mask=keep_undetected_mask)
+
+    @torch.no_grad()
+    def _detect_single(self, img, refine_mode=REFINEMASK_INPAINT, keep_undetected_mask=False):
         img_in, ratio, dw, dh = preprocess_img(img, input_size=self.input_size, device=self.device, half=self.half, to_tensor=self.backend=='torch')
         im_h, im_w = img.shape[:2]
 
@@ -178,6 +201,73 @@ class TextDetector:
             mask_refined = refine_undetected_mask(img, mask, mask_refined, blk_list, refine_mode=refine_mode)
     
         return mask, mask_refined, blk_list
+
+    @torch.no_grad()
+    def detect_batch(self, imgs, refine_mode=REFINEMASK_INPAINT, keep_undetected_mask=False):
+        if self.backend != 'torch' or self.device == 'cpu' or len(imgs) <= 1:
+            return [
+                self._detect_single(img, refine_mode=refine_mode, keep_undetected_mask=keep_undetected_mask)
+                for img in imgs
+            ]
+
+        img_ins = []
+        metadata = []
+        for img in imgs:
+            img_in, ratio, dw, dh = preprocess_img(
+                img,
+                input_size=self.input_size,
+                device=self.device,
+                half=self.half,
+                to_tensor=True,
+            )
+            img_ins.append(img_in)
+            im_h, im_w = img.shape[:2]
+            resize_ratio = (im_w / (self.input_size[0] - dw), im_h / (self.input_size[1] - dh))
+            metadata.append((img, im_w, im_h, dw, dh, resize_ratio))
+
+        img_in = torch.cat(img_ins, dim=0)
+        blks, mask, lines_map = self.net(img_in)
+        blks_batch = postprocess_yolo_batch(
+            blks,
+            self.conf_thresh,
+            self.nms_thresh,
+            [item[5] for item in metadata],
+        )
+
+        def postprocess_one(args):
+            batch_idx, (meta, blks) = args
+            img, im_w, im_h, dw, dh, resize_ratio = meta
+            mask_one = postprocess_mask(mask[batch_idx].clone())
+
+            lines, scores = self.seg_rep(self.input_size, lines_map[batch_idx:batch_idx + 1])
+            box_thresh = 0.6
+            idx = np.where(scores[0] > box_thresh)
+            lines, scores = lines[0][idx], scores[0][idx]
+
+            mask_one = mask_one[: mask_one.shape[0]-dh, : mask_one.shape[1]-dw]
+            mask_one = cv2.resize(mask_one, (im_w, im_h), interpolation=cv2.INTER_LINEAR)
+            if lines.size == 0:
+                lines = []
+            else:
+                lines = lines.astype(np.float64)
+                lines[..., 0] *= resize_ratio[0]
+                lines[..., 1] *= resize_ratio[1]
+                lines = lines.astype(np.int32)
+            blk_list = group_output(blks, lines, im_w, im_h, mask_one)
+            mask_refined = refine_mask(img, mask_one, blk_list, refine_mode=refine_mode)
+            if keep_undetected_mask:
+                mask_refined = refine_undetected_mask(
+                    img,
+                    mask_one,
+                    mask_refined,
+                    blk_list,
+                    refine_mode=refine_mode,
+                )
+
+            return mask_one, mask_refined, blk_list
+
+        with ThreadPoolExecutor() as executor:
+            return list(executor.map(postprocess_one, enumerate(zip(metadata, blks_batch))))
 
 def traverse_by_dict(img_dir_list, dict_dir):
     if isinstance(img_dir_list, str):

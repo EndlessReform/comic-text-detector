@@ -189,10 +189,28 @@ class TextDetector:
         self.seg_rep = SegDetectorRepresenter(thresh=0.3)
 
     @staticmethod
+    def _is_macos_arm():
+        """Return True when running on Apple Silicon (macOS + arm64)."""
+        import platform
+        return platform.system() == "Darwin" and platform.machine() == "arm64"
+
+    @staticmethod
     def _resolve_backend(model_path, backend):
         valid_backends = {'auto', 'torch', 'opencv', 'mlx'}
         if backend not in valid_backends:
             raise ValueError(f"backend must be one of {sorted(valid_backends)}")
+
+        # MLX backend with no explicit path uses the default HF model
+        if model_path is None:
+            if backend == 'mlx':
+                return 'mlx'
+            if backend == 'opencv':
+                raise ValueError("backend='opencv' requires an ONNX detector model path")
+            if backend == 'auto' and TextDetector._is_macos_arm():
+                # On Apple Silicon, MLX is the preferred default
+                return 'mlx'
+            # auto/torch with no path falls through to torch default resolution
+            return 'torch'
 
         model_path = Path(model_path)
         is_onnx = model_path.suffix == '.onnx'
@@ -207,6 +225,19 @@ class TextDetector:
         if is_mlx_artifact:
             if backend not in {'auto', 'mlx'}:
                 raise ValueError("MLX detector artifacts require backend='mlx' or backend='auto'")
+            return 'mlx'
+
+        # Check for hf:// prefix or HF repo-like path
+        model_path_str = str(model_path)
+        is_hf_ref = model_path_str.startswith('hf://') or (
+            '/' in model_path_str
+            and not model_path.is_file()
+            and not model_path.is_dir()
+            and not model_path_str.startswith('.')
+        )
+        if is_hf_ref:
+            if backend not in {'auto', 'mlx'}:
+                raise ValueError("HuggingFace Hub model references require backend='mlx' or backend='auto'")
             return 'mlx'
 
         if backend == 'opencv':

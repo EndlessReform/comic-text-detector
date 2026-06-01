@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import importlib
 import contextlib
+import importlib
 from pathlib import Path
 from typing import Any
 
@@ -9,6 +9,7 @@ import numpy as np
 
 from comic_text_detector.backends import TextDetBackendUnavailable
 from comic_text_detector.mlx_backend.configuration_textdet import CONFIG_FILENAME, TextDetConfig
+from comic_text_detector.mlx_backend.hf_utils import resolve_hf_model_path
 from comic_text_detector.mlx_backend.modeling_textdet import MlxComicTextDetector
 
 
@@ -21,14 +22,18 @@ class MlxTextDetComputeBackend:
 
     def __init__(
         self,
-        model_path: str | Path,
+        model_path: str | Path | None = None,
         *,
         compute_device: str | None = None,
         compute_dtype: str | None = None,
         compile_model: bool = False,
+        hf_cache_dir: Path | None = None,
     ):
-        self.model_path = Path(model_path).expanduser()
+        # Import mlx first (before any HF hub resolution that might trigger importlib)
         self.mx = self._import_mlx()
+        self._hf_cache_dir = hf_cache_dir
+        resolved_path = resolve_hf_model_path(model_path, cache_dir=hf_cache_dir)
+        self.model_path = resolved_path
         self.compute_device = compute_device
         self.compute_dtype_name, self.compute_dtype = self._resolve_dtype(self.mx, compute_dtype)
         self.compile_model = compile_model
@@ -84,28 +89,52 @@ class MlxTextDetComputeBackend:
     def _resolve_config_path(model_path: Path) -> Path:
         if model_path.is_dir():
             config_path = model_path / CONFIG_FILENAME
-        elif model_path.suffix == ".safetensors":
-            config_path = model_path.with_name(CONFIG_FILENAME)
-        else:
-            raise TextDetBackendUnavailable(
-                "The MLX detector backend requires a converted MLX artifact directory or .safetensors file. "
-                "Run comic_text_detector.scripts.convert_to_mlx dump first."
-            )
+            if config_path.is_file():
+                return config_path
+        # Check parent dir for config (e.g. hf_hub nested layouts)
+        if not model_path.is_dir():
+            config_path = model_path.parent / CONFIG_FILENAME
+            if config_path.is_file():
+                return config_path
+        # Walk up to find config in a parent directory (hf_hub caches can nest repos)
+        current = model_path
+        for _ in range(5):
+            parent_config = current / CONFIG_FILENAME
+            if parent_config.is_file():
+                return parent_config
+            parent = current.parent
+            if parent == current:
+                break
+            current = parent
 
-        if not config_path.is_file():
-            raise TextDetBackendUnavailable(f"MLX detector config not found: {config_path}")
-        return config_path
+        raise TextDetBackendUnavailable(
+            f"MLX detector config (config.json) not found near: {model_path}"
+        )
 
     @staticmethod
     def _resolve_weights_path(model_path: Path, config: TextDetConfig) -> Path:
+        # Try model_path directly (directory or file)
         if model_path.is_dir():
             weights_path = model_path / config.weights.file
-        else:
-            weights_path = model_path
+            if weights_path.is_file():
+                return weights_path
+        elif model_path.suffix == ".safetensors":
+            return model_path
 
-        if not weights_path.is_file():
-            raise TextDetBackendUnavailable(f"MLX detector weights not found: {weights_path}")
-        return weights_path
+        # Search in parent directories (for hf_hub nested cache layouts)
+        current = model_path.parent if not model_path.is_dir() else model_path
+        for _ in range(5):
+            weights_path = current / config.weights.file
+            if weights_path.is_file():
+                return weights_path
+            parent = current.parent
+            if parent == current:
+                break
+            current = parent
+
+        raise TextDetBackendUnavailable(
+            f"MLX detector weights ({config.weights.file}) not found near: {model_path}"
+        )
 
     def _stream_ctx(self):
         if self.stream is None:

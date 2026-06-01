@@ -5,7 +5,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
+import shlex
+import sys
 import tempfile
 import urllib.request
 from dataclasses import dataclass
@@ -14,13 +17,24 @@ from typing import Any
 
 import torch
 
+from comic_text_detector.mlx_backend.configuration_textdet import (
+    CONFIG_FILENAME,
+    FusionConfig,
+    HeadConfig,
+    HeadsConfig,
+    TextDetConfig,
+    WeightsConfig,
+    YoloConfig,
+    YoloLayerConfig,
+)
+
 DEFAULT_CHECKPOINT_URL = (
     "https://github.com/zyddnys/manga-image-translator/releases/download/beta-0.2.1/comictextdetector.pt"
 )
-SCHEMA = "comic_text_detector.mlx_conversion.v1"
+SCHEMA = "comic_text_detector.mlx_conversion_report.v1"
 DEFAULT_OUT_DIR = Path("output/detector/mlx-comictextdetector")
-MODEL_FP32_FILENAME = "model.fp32.safetensors"
-CONFIG_FILENAME = "config.json"
+MODEL_FILENAME = "model.safetensors"
+CONVERSION_REPORT_FILENAME = "conversion_report.json"
 
 
 @dataclass(frozen=True)
@@ -213,8 +227,265 @@ def jsonable(value: Any) -> Any:
     return value
 
 
-def build_config(
-    checkpoint: Any,
+def make_divisible(value: float, divisor: int) -> int:
+    return math.ceil(value / divisor) * divisor
+
+
+def scaled_depth(repeats: int, depth_multiple: float) -> int:
+    return max(round(repeats * depth_multiple), 1) if repeats > 1 else repeats
+
+
+def normalize_anchors(anchors: list[list[int]]) -> tuple[tuple[tuple[int, int], ...], ...]:
+    return tuple(
+        tuple((int(values[index]), int(values[index + 1])) for index in range(0, len(values), 2))
+        for values in anchors
+    )
+
+
+def build_yolo_layers(cfg: dict[str, Any]) -> tuple[YoloLayerConfig, ...]:
+    depth_multiple = float(cfg["depth_multiple"])
+    width_multiple = float(cfg["width_multiple"])
+    anchors = cfg["anchors"]
+    num_anchors = len(anchors[0]) // 2
+    output_channels = num_anchors * (int(cfg["nc"]) + 5)
+    input_channels = int(cfg.get("ch", 3))
+    output_channels_by_layer: list[int] = []
+    layers: list[YoloLayerConfig] = []
+
+    for from_index, repeats, module_name, args in cfg["backbone"] + cfg["head"]:
+        args = list(args)
+        repeats = int(repeats)
+        actual_repeats = scaled_depth(repeats, depth_multiple)
+        previous_channels = output_channels_by_layer[-1] if output_channels_by_layer else input_channels
+
+        def channels_for(index: int) -> int:
+            return previous_channels if index == -1 else output_channels_by_layer[index]
+
+        if module_name in {"Conv", "C3", "SPPF"}:
+            raw_out_channels = int(args[0])
+            out_channels = (
+                raw_out_channels
+                if raw_out_channels == output_channels
+                else make_divisible(raw_out_channels * width_multiple, 8)
+            )
+            in_channels = channels_for(from_index)
+            layer_type = str(module_name)
+            if layer_type == "Conv":
+                layer = YoloLayerConfig(
+                    type=layer_type,
+                    from_index=from_index,
+                    repeats=actual_repeats,
+                    in_channels=in_channels,
+                    out_channels=out_channels,
+                    kernel=int(args[1]),
+                    stride=int(args[2]),
+                    padding=int(args[3]) if len(args) > 3 else None,
+                )
+            elif layer_type == "C3":
+                layer = YoloLayerConfig(
+                    type=layer_type,
+                    from_index=from_index,
+                    repeats=actual_repeats,
+                    in_channels=in_channels,
+                    out_channels=out_channels,
+                    shortcut=bool(args[1]) if len(args) > 1 else True,
+                )
+            else:
+                layer = YoloLayerConfig(
+                    type=layer_type,
+                    from_index=from_index,
+                    repeats=actual_repeats,
+                    in_channels=in_channels,
+                    out_channels=out_channels,
+                    kernel=int(args[1]),
+                )
+        elif module_name == "nn.Upsample":
+            out_channels = channels_for(from_index)
+            layer = YoloLayerConfig(
+                type="Upsample",
+                from_index=from_index,
+                repeats=1,
+                in_channels=out_channels,
+                out_channels=out_channels,
+                scale_factor=int(args[1]),
+                mode=str(args[2]),
+            )
+        elif module_name == "Concat":
+            out_channels = sum(channels_for(index) for index in from_index)
+            layer = YoloLayerConfig(
+                type="Concat",
+                from_index=from_index,
+                repeats=1,
+                in_channels=[channels_for(index) for index in from_index],
+                out_channels=out_channels,
+                dimension=int(args[0]),
+            )
+        elif module_name == "Detect":
+            out_channels = output_channels
+            layer = YoloLayerConfig(
+                type="Detect",
+                from_index=from_index,
+                repeats=1,
+                in_channels=[channels_for(index) for index in from_index],
+                out_channels=out_channels,
+            )
+        else:
+            raise ValueError(f"Unsupported YOLO layer type: {module_name}")
+
+        layers.append(layer)
+        output_channels_by_layer.append(int(out_channels))
+
+    return tuple(layers)
+
+
+def shape_by_key(infos: list[ConvertedTensorInfo]) -> dict[str, tuple[int, ...]]:
+    return {info.key: info.output_shape for info in infos}
+
+
+def count_c3_repeats(shapes: dict[str, tuple[int, ...]], prefix: str) -> int:
+    repeats = set()
+    marker = f"{prefix}.m."
+    for key in shapes:
+        if not key.startswith(marker):
+            continue
+        rest = key.removeprefix(marker)
+        index = rest.split(".", 1)[0]
+        if index.isdigit():
+            repeats.add(int(index))
+    return max(repeats) + 1 if repeats else 0
+
+
+def c3_layer(shapes: dict[str, tuple[int, ...]], name: str, prefix: str, layer_type: str) -> dict[str, Any]:
+    cv1_shape = shapes[f"{prefix}.cv1.conv.weight"]
+    cv3_shape = shapes[f"{prefix}.cv3.conv.weight"]
+    return {
+        "name": name,
+        "type": layer_type,
+        "in_channels": cv1_shape[-1],
+        "out_channels": cv3_shape[0],
+        "repeats": count_c3_repeats(shapes, prefix),
+    }
+
+
+def conv_layer(
+    shapes: dict[str, tuple[int, ...]],
+    name: str,
+    prefix: str,
+    layer_type: str,
+    *,
+    stride: int,
+    padding: int,
+) -> dict[str, Any]:
+    shape = shapes[f"{prefix}.weight"]
+    return {
+        "name": name,
+        "type": layer_type,
+        "in_channels": shape[-1],
+        "out_channels": shape[0],
+        "kernel": shape[1],
+        "stride": stride,
+        "padding": padding,
+    }
+
+
+def build_heads_config(infos: list[ConvertedTensorInfo]) -> HeadsConfig:
+    shapes = shape_by_key(infos)
+    segmentation_layers = (
+        c3_layer(shapes, "down_conv1", "text_seg.down_conv1.conv", "DownC3"),
+        c3_layer(shapes, "upconv0", "text_seg.upconv0.conv.0", "UpC3"),
+        c3_layer(shapes, "upconv2", "text_seg.upconv2.conv.0", "UpC3"),
+        c3_layer(shapes, "upconv3", "text_seg.upconv3.conv.0", "UpC3"),
+        c3_layer(shapes, "upconv4", "text_seg.upconv4.conv.0", "UpC3"),
+        c3_layer(shapes, "upconv5", "text_seg.upconv5.conv.0", "UpC3"),
+        conv_layer(
+            shapes,
+            "upconv6",
+            "text_seg.upconv6.0",
+            "ConvTranspose2d",
+            stride=2,
+            padding=1,
+        ),
+    )
+    db_layers = (
+        c3_layer(shapes, "upconv3", "text_det.upconv3.conv.0", "UpC3"),
+        c3_layer(shapes, "upconv4", "text_det.upconv4.conv.0", "UpC3"),
+        conv_layer(shapes, "projection", "text_det.conv.0", "Conv2d", stride=1, padding=0),
+        conv_layer(shapes, "binarize.0", "text_det.binarize.0", "Conv2d", stride=1, padding=1),
+        conv_layer(
+            shapes,
+            "binarize.3",
+            "text_det.binarize.3",
+            "ConvTranspose2d",
+            stride=2,
+            padding=0,
+        ),
+        conv_layer(
+            shapes,
+            "binarize.6",
+            "text_det.binarize.6",
+            "ConvTranspose2d",
+            stride=2,
+            padding=0,
+        ),
+        conv_layer(shapes, "thresh.0", "text_det.thresh.0", "Conv2d", stride=1, padding=1),
+        conv_layer(
+            shapes,
+            "thresh.3",
+            "text_det.thresh.3",
+            "ConvTranspose2d",
+            stride=2,
+            padding=0,
+        ),
+        conv_layer(
+            shapes,
+            "thresh.6",
+            "text_det.thresh.6",
+            "ConvTranspose2d",
+            stride=2,
+            padding=0,
+        ),
+    )
+    return HeadsConfig(
+        segmentation=HeadConfig(activation="leaky", layers=segmentation_layers),
+        db=HeadConfig(activation="relu", layers=db_layers),
+    )
+
+
+def build_config(checkpoint: Any, output_path: Path, infos: list[ConvertedTensorInfo]) -> dict[str, Any]:
+    if not isinstance(checkpoint, dict) or not isinstance(checkpoint.get("blk_det"), dict):
+        raise ValueError("Expected checkpoint with blk_det cfg")
+
+    cfg = jsonable(checkpoint["blk_det"]["cfg"])
+    yolo_layers = build_yolo_layers(cfg)
+    detect_layer = yolo_layers[-1]
+    detect_indices = tuple(int(index) for index in detect_layer.from_index)
+    config = TextDetConfig(
+        model_type="comic_text_detector",
+        architectures=("MlxComicTextDetector",),
+        format_version=1,
+        torch_dtype="float32",
+        input_layout="NCHW",
+        internal_layout="NHWC",
+        image_size=1024,
+        num_classes=int(cfg["nc"]),
+        id2label={"0": "eng", "1": "ja"},
+        label2id={"eng": 0, "ja": 1},
+        weights=WeightsConfig(file=output_path.name),
+        fusion=FusionConfig(conv_bn="forward", trunk_bn_eps=1e-3, head_bn_eps=1e-5),
+        yolo=YoloConfig(
+            depth_multiple=float(cfg["depth_multiple"]),
+            width_multiple=float(cfg["width_multiple"]),
+            feature_indices=(1, 3, 5, 7, 9),
+            detect_indices=detect_indices,
+            anchors=normalize_anchors(cfg["anchors"]),
+            layers=yolo_layers,
+        ),
+        heads=build_heads_config(infos),
+    )
+    return config.to_dict()
+
+
+def build_conversion_report(
     checkpoint_path: Path,
     output_path: Path,
     infos: list[ConvertedTensorInfo],
@@ -224,7 +495,7 @@ def build_config(
         transform_counts[info.layout] = transform_counts.get(info.layout, 0) + 1
 
     total_bytes = sum(info.bytes for info in infos)
-    config = {
+    return {
         "schema": SCHEMA,
         "source": {
             "checkpoint_path": str(checkpoint_path),
@@ -239,6 +510,10 @@ def build_config(
             "total_elements": sum(info.elements for info in infos),
             "total_bytes": total_bytes,
             "total_mib": round(total_bytes / (1024 * 1024), 3),
+        },
+        "conversion": {
+            "command": shlex.join(sys.argv),
+            "torch_version": torch.__version__,
         },
         "layouts": {
             "public_input": "NCHW",
@@ -261,9 +536,6 @@ def build_config(
             for info in infos
         ],
     }
-    if isinstance(checkpoint, dict) and isinstance(checkpoint.get("blk_det"), dict):
-        config["yolov5"] = {"cfg": jsonable(checkpoint["blk_det"].get("cfg"))}
-    return config
 
 
 def render_keys_report(checkpoint_path: Path, tensors: list[TensorInfo]) -> str:
@@ -320,8 +592,9 @@ def run_dump(args: argparse.Namespace) -> None:
     payload, infos = build_safetensors_payload(checkpoint)
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    output_path = args.out_dir / MODEL_FP32_FILENAME
+    output_path = args.out_dir / MODEL_FILENAME
     config_path = args.out_dir / CONFIG_FILENAME
+    report_path = args.out_dir / CONVERSION_REPORT_FILENAME
     save_file(
         payload,
         output_path,
@@ -331,14 +604,17 @@ def run_dump(args: argparse.Namespace) -> None:
             "source_checkpoint_sha256": sha256_file(checkpoint_path),
         },
     )
-    config = build_config(checkpoint, checkpoint_path, output_path, infos)
+    config = build_config(checkpoint, output_path, infos)
+    report = build_conversion_report(checkpoint_path, output_path, infos)
     config_path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     print(f"wrote safetensors: {output_path}")
     print(f"wrote config: {config_path}")
-    print(f"tensor_count\t{config['artifact']['tensor_count']}")
-    print(f"total_mib\t{config['artifact']['total_mib']:.3f}")
-    for layout, count in sorted(config["transform_counts"].items()):
+    print(f"wrote conversion report: {report_path}")
+    print(f"tensor_count\t{report['artifact']['tensor_count']}")
+    print(f"total_mib\t{report['artifact']['total_mib']:.3f}")
+    for layout, count in sorted(report["transform_counts"].items()):
         print(f"{layout}\t{count}")
 
 

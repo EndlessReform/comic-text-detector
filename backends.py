@@ -49,11 +49,19 @@ def create_compute_backend(
     device: str = "cpu",
     half: bool = False,
     act: str = "leaky",
+    compute_device: str | None = None,
+    compute_dtype: str | None = None,
+    compile_model: bool = False,
 ) -> TextDetComputeBackend:
     if backend == "torch":
         return TorchTextDetComputeBackend(model_path=model_path, device=device, half=half, act=act)
     if backend == "mlx":
         from comic_text_detector.mlx_backend import MlxTextDetComputeBackend
 
-        return MlxTextDetComputeBackend(model_path=model_path)
+        return MlxTextDetComputeBackend(
+            model_path=model_path,
+            compute_device=compute_device,
+            compute_dtype=compute_dtype,
+            compile_model=compile_model,
+        )
     raise ValueError(f"unknown text detector compute backend: {backend}")

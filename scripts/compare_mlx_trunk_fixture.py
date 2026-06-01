@@ -59,6 +59,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--atol", default=1e-4, type=float)
     parser.add_argument("--rtol", default=1e-4, type=float)
+    parser.add_argument(
+        "--device",
+        default="cpu",
+        choices=("cpu", "gpu", "default"),
+        help=(
+            "MLX compute device. 'cpu' uses the precision-preserving direct conv path "
+            "needed for fixture parity; 'gpu' is faster but its Winograd 3x3 path loses "
+            "fp32 accuracy. 'default' keeps the MLX default device."
+        ),
+    )
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
     return parser.parse_args()
 
@@ -66,7 +76,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     fixture = np.load(args.fixture)
-    backend = MlxTextDetComputeBackend(args.artifact)
+    compute_device = None if args.device == "default" else args.device
+    backend = MlxTextDetComputeBackend(args.artifact, compute_device=compute_device)
     actual = backend.forward_trunk_features(fixture["input.nchw.fp32"])
     rows, passed = compare_features(fixture, actual, rtol=args.rtol, atol=args.atol)
 

@@ -143,7 +143,21 @@ class TextDetector:
     lang_list = ['eng', 'ja', 'unknown']
     langcls2idx = {'eng': 0, 'ja': 1, 'unknown': 2}
 
-    def __init__(self, model_path, input_size=1024, device='cpu', half=False, nms_thresh=0.35, conf_thresh=0.4, mask_thresh=0.3, act='leaky', backend='auto'):
+    def __init__(
+        self,
+        model_path,
+        input_size=1024,
+        device='cpu',
+        half=False,
+        nms_thresh=0.35,
+        conf_thresh=0.4,
+        mask_thresh=0.3,
+        act='leaky',
+        backend='auto',
+        compute_device=None,
+        compute_dtype=None,
+        compile_model=False,
+    ):
         super(TextDetector, self).__init__()
 
         self.backend = self._resolve_backend(model_path, backend)
@@ -159,6 +173,9 @@ class TextDetector:
                 device=device,
                 half=half,
                 act=act,
+                compute_device=compute_device,
+                compute_dtype=compute_dtype,
+                compile_model=compile_model,
             )
             self.net = getattr(self.compute_backend, 'net', None)
 
@@ -177,11 +194,20 @@ class TextDetector:
         if backend not in valid_backends:
             raise ValueError(f"backend must be one of {sorted(valid_backends)}")
 
-        is_onnx = Path(model_path).suffix == '.onnx'
+        model_path = Path(model_path)
+        is_onnx = model_path.suffix == '.onnx'
         if is_onnx:
             if backend not in {'auto', 'opencv'}:
                 raise ValueError("ONNX detector models require backend='opencv' or backend='auto'")
             return 'opencv'
+
+        is_mlx_artifact = model_path.suffix == '.safetensors' or (
+            model_path.is_dir() and (model_path / 'config.json').is_file()
+        )
+        if is_mlx_artifact:
+            if backend not in {'auto', 'mlx'}:
+                raise ValueError("MLX detector artifacts require backend='mlx' or backend='auto'")
+            return 'mlx'
 
         if backend == 'opencv':
             raise ValueError("backend='opencv' requires an ONNX detector model")
